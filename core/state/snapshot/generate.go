@@ -216,6 +216,9 @@ func (dl *diskLayer) proveRange(ctx *generatorContext, trieId *trie.ID, prefix [
 			}
 		}
 	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
 	// Update metrics for database iteration and merkle proving
 	if kind == snapStorage {
 		snapStorageSnapReadCounter.Inc(time.Since(start).Nanoseconds())
@@ -576,6 +579,9 @@ func generateAccounts(ctx *generatorContext, dl *diskLayer, accMarker []byte) er
 		// Make sure to clear all dangling storages before this account
 		account := common.BytesToHash(key)
 		ctx.removeStorageBefore(account)
+		if err := ctx.storage.Error(); err != nil {
+			return err
+		}
 
 		start := time.Now()
 		if delete {
@@ -584,7 +590,7 @@ func generateAccounts(ctx *generatorContext, dl *diskLayer, accMarker []byte) er
 			snapAccountWriteCounter.Inc(time.Since(start).Nanoseconds())
 
 			ctx.removeStorageAt(account)
-			return nil
+			return ctx.storage.Error()
 		}
 		// Retrieve the current account and flatten it into the internal format
 		var acc types.StateAccount
@@ -627,6 +633,9 @@ func generateAccounts(ctx *generatorContext, dl *diskLayer, accMarker []byte) er
 		// verify or regenerate the contract storage.
 		if acc.Root == types.EmptyRootHash {
 			ctx.removeStorageAt(account)
+			if err := ctx.storage.Error(); err != nil {
+				return err
+			}
 		} else {
 			var storeMarker []byte
 			if accMarker != nil && bytes.Equal(account[:], accMarker) && len(dl.genMarker) > common.HashLength {
@@ -659,6 +668,9 @@ func generateAccounts(ctx *generatorContext, dl *diskLayer, accMarker []byte) er
 		// All the left storages should be treated as dangling.
 		if origin == nil || exhausted {
 			ctx.removeStorageLeft()
+			if err := ctx.storage.Error(); err != nil {
+				return err
+			}
 			break
 		}
 		accountRange = accountCheckRange
@@ -689,7 +701,7 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 	// For the account or storage slot at the interruption, they will be
 	// processed twice by the generator(they are already processed in the
 	// last run) but it's fine.
-	ctx := newGeneratorContext(stats, dl.diskdb, accMarker, dl.genMarker)
+	ctx := newGeneratorContext(stats, dl.diskdb, accMarker, dl.genMarker, dl.cancel)
 	defer ctx.close()
 
 	if err := generateAccounts(ctx, dl, accMarker); err != nil {

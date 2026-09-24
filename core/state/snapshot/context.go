@@ -93,15 +93,17 @@ type generatorContext struct {
 	storage *holdableIterator   // Iterator of storage snapshot data
 	batch   ethdb.Batch         // Database batch for writing batch data atomically
 	logged  time.Time           // The timestamp when last generation progress was displayed
+	cancel  <-chan struct{}     // Closed when the generation is asked to stop
 }
 
 // newGeneratorContext initializes the context for generation.
-func newGeneratorContext(stats *generatorStats, db ethdb.KeyValueStore, accMarker []byte, storageMarker []byte) *generatorContext {
+func newGeneratorContext(stats *generatorStats, db ethdb.KeyValueStore, accMarker []byte, storageMarker []byte, cancel <-chan struct{}) *generatorContext {
 	ctx := &generatorContext{
 		stats:  stats,
 		db:     db,
 		batch:  db.NewBatch(),
 		logged: time.Now(),
+		cancel: cancel,
 	}
 	ctx.openIterator(snapAccount, accMarker)
 	ctx.openIterator(snapStorage, storageMarker)
@@ -113,11 +115,11 @@ func newGeneratorContext(stats *generatorStats, db ethdb.KeyValueStore, accMarke
 // to time to avoid blocking leveldb compaction for a long time.
 func (ctx *generatorContext) openIterator(kind string, start []byte) {
 	if kind == snapAccount {
-		iter := ctx.db.NewIterator(rawdb.SnapshotAccountPrefix, start)
+		iter := newAbortableIterator(ctx.db.NewIterator(rawdb.SnapshotAccountPrefix, start), ctx.cancel)
 		ctx.account = newHoldableIterator(rawdb.NewKeyLengthIterator(iter, 1+common.HashLength))
 		return
 	}
-	iter := ctx.db.NewIterator(rawdb.SnapshotStoragePrefix, start)
+	iter := newAbortableIterator(ctx.db.NewIterator(rawdb.SnapshotStoragePrefix, start), ctx.cancel)
 	ctx.storage = newHoldableIterator(rawdb.NewKeyLengthIterator(iter, 1+2*common.HashLength))
 }
 
@@ -131,6 +133,9 @@ func (ctx *generatorContext) reopenIterator(kind string) {
 		iter = ctx.storage
 	}
 	hasNext := iter.Next()
+	if !hasNext && iter.Error() != nil {
+		return // Keep the failed iterator so its error reaches the next reader
+	}
 	if !hasNext {
 		// Iterator exhausted, release forever and create an already exhausted virtual iterator
 		iter.Release()
