@@ -117,11 +117,13 @@ func newGeneratorContext(stats *generatorStats, db ethdb.KeyValueStore, accMarke
 // to time to avoid blocking leveldb compaction for a long time.
 func (ctx *generatorContext) openIterator(kind string, start []byte) {
 	if kind == snapAccount {
-		iter := newAbortableIterator(ctx.db.NewIterator(rawdb.SnapshotAccountPrefix, start), ctx.cancel)
+		iter := ctx.db.NewIterator(rawdb.SnapshotAccountPrefix, start)
+		iter = newAbortableIterator(iter, ctx.cancel) //libevm
 		ctx.account = newHoldableIterator(rawdb.NewKeyLengthIterator(iter, 1+common.HashLength))
 		return
 	}
-	iter := newAbortableIterator(ctx.db.NewIterator(rawdb.SnapshotStoragePrefix, start), ctx.cancel)
+	iter := ctx.db.NewIterator(rawdb.SnapshotStoragePrefix, start)
+	iter = newAbortableIterator(iter, ctx.cancel) //libevm
 	ctx.storage = newHoldableIterator(rawdb.NewKeyLengthIterator(iter, 1+2*common.HashLength))
 }
 
