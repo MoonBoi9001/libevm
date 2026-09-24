@@ -190,12 +190,38 @@ func TestKeyRangesWith(t *testing.T) {
 		t.Fatalf("stretches = %v; want %v", rs, want)
 	}
 
+	rs = rs.with(stretch(0x28, 0x58, minSkipKeys)) // bridges both
+	if want := (keyRanges{stretch(0x10, 0x60, minSkipKeys*2)}); fmt.Sprint(rs) != fmt.Sprint(want) {
+		t.Fatalf("stretches = %v; want %v", rs, want)
+	}
+
 	rs = nil
 	for i := 0; i <= maxSkipRanges; i++ {
 		rs = rs.with(keyRange{from: []byte{byte(i >> 8), byte(i)}, to: []byte{byte(i >> 8), byte(i), 0xff}, keys: minSkipKeys + i})
 	}
 	if len(rs) != maxSkipRanges || rs[0].keys != minSkipKeys+1 {
 		t.Errorf("after adding %d stretches, kept %d starting with %d keys; want %d, without the smallest", maxSkipRanges+1, len(rs), rs[0].keys, maxSkipRanges)
+	}
+}
+
+func TestKeyRangesAfter(t *testing.T) {
+	stretch := func(from, to byte) keyRange { return keyRange{from: []byte{from}, to: []byte{to}, keys: minSkipKeys} }
+	rs := keyRanges{stretch(0x10, 0x20), stretch(0x30, 0x40), stretch(0x50, 0x60)}
+	before := fmt.Sprint(rs)
+
+	got := rs.after([]byte{0x38})
+	want := keyRanges{{from: []byte{0x38, 0}, to: []byte{0x40}, keys: minSkipKeys}, stretch(0x50, 0x60)}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("after(0x38) = %v; want %v", got, want)
+	}
+	if got := rs.after([]byte{0x40}); fmt.Sprint(got) != fmt.Sprint(rs[2:]) {
+		t.Errorf("after(0x40) = %v; want %v", got, rs[2:])
+	}
+	if fmt.Sprint(rs) != before {
+		t.Errorf("after modified its receiver to %v; want %v", rs, before)
+	}
+	if allocs := testing.AllocsPerRun(10, func() { rs.after([]byte{0x05}) }); allocs != 0 {
+		t.Errorf("after a key before every stretch made %v allocations; want 0", allocs)
 	}
 }
 

@@ -19,6 +19,7 @@ package snapshot
 import (
 	"bytes"
 	"slices"
+	"sort"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/rawdb"
@@ -52,8 +53,8 @@ func (r keyRange) after(key []byte) keyRange {
 	return keyRange{from: append(common.CopyBytes(key), 0), to: r.to, keys: r.keys}
 }
 
-// keyRanges are disjoint stretches sorted by key. Methods return new slices and
-// never modify the receiver, so a copy handed to an iterator stays valid.
+// keyRanges are disjoint stretches sorted by key. Methods never modify the
+// receiver or its elements, so a copy handed to an iterator stays valid.
 type keyRanges []keyRange
 
 // with returns rs plus r, merged with any stretch it overlaps, keeping only the
@@ -63,22 +64,22 @@ func (rs keyRanges) with(r keyRange) keyRanges {
 		return rs
 	}
 	r = keyRange{from: common.CopyBytes(r.from), to: common.CopyBytes(r.to), keys: r.keys}
-	out := make(keyRanges, 0, len(rs)+1)
-	for _, o := range rs {
-		if bytes.Compare(o.to, r.from) < 0 || bytes.Compare(o.from, r.to) > 0 {
-			out = append(out, o)
-			continue
+	// rs[i:j] are the stretches r overlaps.
+	i := sort.Search(len(rs), func(k int) bool { return bytes.Compare(rs[k].to, r.from) >= 0 })
+	j := sort.Search(len(rs), func(k int) bool { return bytes.Compare(rs[k].from, r.to) > 0 })
+	if i < j {
+		if bytes.Compare(rs[i].from, r.from) < 0 {
+			r.from = rs[i].from
 		}
-		if bytes.Compare(o.from, r.from) < 0 {
-			r.from = o.from
+		if bytes.Compare(rs[j-1].to, r.to) > 0 {
+			r.to = rs[j-1].to
 		}
-		if bytes.Compare(o.to, r.to) > 0 {
-			r.to = o.to
+		for _, o := range rs[i:j] {
+			r.keys = max(r.keys, o.keys)
 		}
-		r.keys = max(r.keys, o.keys)
 	}
-	out = append(out, r)
-	slices.SortFunc(out, func(a, b keyRange) int { return bytes.Compare(a.from, b.from) })
+	out := make(keyRanges, 0, len(rs)-(j-i)+1)
+	out = append(append(append(out, rs[:i]...), r), rs[j:]...)
 	if len(out) > maxSkipRanges {
 		fewest := 0
 		for i := range out {
@@ -93,12 +94,12 @@ func (rs keyRanges) with(r keyRange) keyRanges {
 
 // after returns the parts of rs that sort after key.
 func (rs keyRanges) after(key []byte) keyRanges {
-	out := make(keyRanges, 0, len(rs))
-	for _, r := range rs {
-		if r = r.after(key); !r.empty() {
-			out = append(out, r)
-		}
+	i := sort.Search(len(rs), func(k int) bool { return bytes.Compare(rs[k].to, key) > 0 })
+	if i == len(rs) || bytes.Compare(rs[i].from, key) > 0 {
+		return rs[i:]
 	}
+	out := slices.Clone(rs[i:])
+	out[0] = out[0].after(key)
 	return out
 }
 
