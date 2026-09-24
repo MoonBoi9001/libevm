@@ -32,6 +32,9 @@ import (
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/ethdb/memorydb"
+	"github.com/ava-labs/libevm/rlp"
+	"github.com/ava-labs/libevm/trie"
+	"github.com/ava-labs/libevm/trie/trienode"
 )
 
 // stepCountingDB counts the steps taken by its snapshot iterators and pauses
@@ -259,4 +262,80 @@ func TestGenerateSkipsStretchesFoundEmpty(t *testing.T) {
 		db.resume <- struct{}{}
 		layer = <-next
 	}
+}
+
+// TestGenerateRereadsEntriesWrittenPastItsMarker has a run write account entries
+// to disk past its saved marker, as a flush while deleting dangling storage does,
+// and then fail. The next run, on a state that has since dropped one of those
+// accounts, has to read that entry to delete it.
+func TestGenerateRereadsEntriesWrittenPastItsMarker(t *testing.T) {
+	helper := newHelper(rawdb.HashScheme)
+	names := make([]string, 50)
+	last := 0
+	for i := range names {
+		names[i] = fmt.Sprintf("acc-%d", i)
+		if bytes.Compare(hashData([]byte(names[i])).Bytes(), hashData([]byte(names[last])).Bytes()) > 0 {
+			last = i
+		}
+	}
+	broken, gone := names[last], names[(last+1)%len(names)]
+	brokenHash, goneHash := hashData([]byte(broken)), hashData([]byte(gone))
+
+	stRoot := helper.makeStorageTrie(brokenHash, []string{"key-1"}, []string{"val-1"}, true)
+	for _, name := range names {
+		acc := &types.StateAccount{Balance: uint256.NewInt(1), Root: types.EmptyRootHash, CodeHash: types.EmptyCodeHash.Bytes()}
+		if name == broken {
+			acc.Root = stRoot
+		}
+		helper.addTrieAccount(name, acc)
+	}
+	root := helper.Commit()
+
+	// The first run fails on the last account's missing storage, but only after
+	// deleting enough dangling storage just before it to flush what it wrote.
+	rawdb.DeleteTrieNode(helper.diskdb, brokenHash, nil, stRoot, rawdb.HashScheme)
+	dangling := common.BytesToHash(decKey(brokenHash.Bytes()))
+	for i := 0; i < 2_000; i++ {
+		rawdb.WriteStorageSnapshot(helper.diskdb, dangling, hashData([]byte(fmt.Sprint(i))), []byte{1})
+	}
+	putTrieNodeLikeKeys(t, helper.diskdb, rawdb.SnapshotAccountPrefix, 1_000)
+
+	first := generateSnapshot(helper.diskdb, helper.triedb, 16, root)
+	select {
+	case <-first.done:
+	case <-time.After(time.Minute):
+		t.Fatal("first run neither failed nor finished")
+	}
+	var gen journalGenerator
+	if err := rlp.DecodeBytes(rawdb.ReadSnapshotGenerator(helper.diskdb), &gen); err != nil {
+		t.Fatal(err)
+	}
+	if gen.Done || rawdb.ReadAccountSnapshot(helper.diskdb, goneHash) == nil || bytes.Compare(goneHash[:], gen.Marker) <= 0 {
+		t.Fatalf("first run saved marker %x (done %t); want account %x written past it", gen.Marker, gen.Done, goneHash)
+	}
+
+	tr, err := trie.NewStateTrie(trie.StateTrieID(root), helper.triedb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.MustDelete([]byte(gone))
+	tr.MustDelete([]byte(broken))
+	next, nodes, err := tr.Commit(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := helper.triedb.Update(next, root, 0, trienode.NewWithNodeSet(nodes), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := helper.triedb.Commit(next, false); err != nil {
+		t.Fatal(err)
+	}
+
+	layer := diffToDisk(newDiffLayer(first, next, nil, nil, nil))
+	select {
+	case <-layer.genPending:
+	case <-time.After(time.Minute):
+		t.Fatal("second run did not finish")
+	}
+	checkSnapRoot(t, layer, next)
 }
