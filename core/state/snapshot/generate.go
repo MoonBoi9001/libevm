@@ -481,6 +481,8 @@ func (dl *diskLayer) generateRange(ctx *generatorContext, trieId *trie.ID, prefi
 // checkAndFlush checks if an interruption signal is received or the
 // batch size has exceeded the allowance.
 func (dl *diskLayer) checkAndFlush(ctx *generatorContext, current []byte) error {
+	ctx.noteProgress(current)
+
 	aborting := false
 	select {
 	case <-dl.cancel:
@@ -689,8 +691,9 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 	// For the account or storage slot at the interruption, they will be
 	// processed twice by the generator(they are already processed in the
 	// last run) but it's fine.
-	ctx := newGeneratorContext(stats, dl.diskdb, accMarker, dl.genMarker)
+	ctx := newGeneratorContext(stats, dl.diskdb, accMarker, dl.genMarker, dl.genSkips)
 	defer ctx.close()
+	defer dl.keepSkips(ctx)
 
 	if err := generateAccounts(ctx, dl, accMarker); err != nil {
 		// Check if error was due to abort

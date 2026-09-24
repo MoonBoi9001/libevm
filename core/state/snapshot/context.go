@@ -93,15 +93,20 @@ type generatorContext struct {
 	storage *holdableIterator   // Iterator of storage snapshot data
 	batch   ethdb.Batch         // Database batch for writing batch data atomically
 	logged  time.Time           // The timestamp when last generation progress was displayed
+
+	skips       generatorSkips    // Stretches known to hold no snapshot entries
+	accountRead *skippingIterator // Raw account iterator, tracking what it has read
+	storageRead *skippingIterator // Raw storage iterator, tracking what it has read
 }
 
 // newGeneratorContext initializes the context for generation.
-func newGeneratorContext(stats *generatorStats, db ethdb.KeyValueStore, accMarker []byte, storageMarker []byte) *generatorContext {
+func newGeneratorContext(stats *generatorStats, db ethdb.KeyValueStore, accMarker []byte, storageMarker []byte, skips generatorSkips) *generatorContext {
 	ctx := &generatorContext{
 		stats:  stats,
 		db:     db,
 		batch:  db.NewBatch(),
 		logged: time.Now(),
+		skips:  skips,
 	}
 	ctx.openIterator(snapAccount, accMarker)
 	ctx.openIterator(snapStorage, storageMarker)
@@ -113,11 +118,11 @@ func newGeneratorContext(stats *generatorStats, db ethdb.KeyValueStore, accMarke
 // to time to avoid blocking leveldb compaction for a long time.
 func (ctx *generatorContext) openIterator(kind string, start []byte) {
 	if kind == snapAccount {
-		iter := ctx.db.NewIterator(rawdb.SnapshotAccountPrefix, start)
+		iter := ctx.snapshotIterator(kind, rawdb.SnapshotAccountPrefix, start, 1+common.HashLength)
 		ctx.account = newHoldableIterator(rawdb.NewKeyLengthIterator(iter, 1+common.HashLength))
 		return
 	}
-	iter := ctx.db.NewIterator(rawdb.SnapshotStoragePrefix, start)
+	iter := ctx.snapshotIterator(kind, rawdb.SnapshotStoragePrefix, start, 1+2*common.HashLength)
 	ctx.storage = newHoldableIterator(rawdb.NewKeyLengthIterator(iter, 1+2*common.HashLength))
 }
 
@@ -131,6 +136,7 @@ func (ctx *generatorContext) reopenIterator(kind string) {
 		iter = ctx.storage
 	}
 	hasNext := iter.Next()
+	ctx.keepRead(kind)
 	if !hasNext {
 		// Iterator exhausted, release forever and create an already exhausted virtual iterator
 		iter.Release()

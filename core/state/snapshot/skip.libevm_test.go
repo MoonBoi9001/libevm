@@ -1,0 +1,262 @@
+// Copyright 2026 the libevm authors.
+//
+// The libevm additions to go-ethereum are free software: you can redistribute
+// them and/or modify them under the terms of the GNU Lesser General Public License
+// as published by the Free Software Foundation, either version 3 of the License,
+// or (at your option) any later version.
+//
+// The libevm additions are distributed in the hope that they will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser
+// General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see
+// <http://www.gnu.org/licenses/>.
+
+package snapshot
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/holiman/uint256"
+
+	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/core/rawdb"
+	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/crypto"
+	"github.com/ava-labs/libevm/ethdb"
+	"github.com/ava-labs/libevm/ethdb/memorydb"
+)
+
+// stepCountingDB counts the steps taken by its snapshot iterators and pauses
+// on step pauseAt, if set, so a test can restart generation there.
+type stepCountingDB struct {
+	ethdb.KeyValueStore
+	steps   atomic.Int64
+	pauseAt atomic.Int64
+	paused  chan struct{}
+	resume  chan struct{}
+}
+
+func (db *stepCountingDB) NewIterator(prefix, start []byte) ethdb.Iterator {
+	it := db.KeyValueStore.NewIterator(prefix, start)
+	if !bytes.Equal(prefix, rawdb.SnapshotAccountPrefix) && !bytes.Equal(prefix, rawdb.SnapshotStoragePrefix) {
+		return it
+	}
+	return &stepCountingIterator{Iterator: it, db: db}
+}
+
+type stepCountingIterator struct {
+	ethdb.Iterator
+	db *stepCountingDB
+}
+
+func (it *stepCountingIterator) Next() bool {
+	if it.db.steps.Add(1) == it.db.pauseAt.Load() {
+		it.db.paused <- struct{}{}
+		<-it.db.resume
+	}
+	return it.Iterator.Next()
+}
+
+// putTrieNodeLikeKeys stores n keys of a hash-scheme trie node's length that
+// start with prefix, spread over the range the way node hashes are. The
+// snapshot iterators cover that range, so they have to step over every one.
+func putTrieNodeLikeKeys(t *testing.T, db ethdb.KeyValueWriter, prefix []byte, n uint64) {
+	t.Helper()
+	for i := uint64(0); i < n; i++ {
+		var seed [8]byte
+		binary.BigEndian.PutUint64(seed[:], i)
+		key := append(common.CopyBytes(prefix), crypto.Keccak256(prefix, seed[:])[:common.HashLength-len(prefix)]...)
+		if err := db.Put(key, []byte{1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSkippingIteratorStepsOverKnownEmptyStretch(t *testing.T) {
+	prefix := rawdb.SnapshotAccountPrefix
+	entry := func(b byte) []byte {
+		return append(common.CopyBytes(prefix), bytes.Repeat([]byte{b}, common.HashLength)...)
+	}
+	db := memorydb.New()
+	first, last := entry(0x01), entry(0xfe)
+	for _, key := range [][]byte{first, last} {
+		if err := db.Put(key, []byte{1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putTrieNodeLikeKeys(t, db, prefix, 1_000)
+
+	read := func(known keyRanges) (entries [][]byte, steps int64, it *skippingIterator) {
+		counted := &stepCountingDB{KeyValueStore: db}
+		it = newSkippingIterator(counted, prefix, nil, 1+common.HashLength, known, nil)
+		defer it.Release()
+		for it.Next() {
+			if len(it.Key()) == 1+common.HashLength {
+				entries = append(entries, common.CopyBytes(it.Key()))
+			}
+		}
+		if err := it.Error(); err != nil {
+			t.Fatal(err)
+		}
+		return entries, counted.steps.Load(), it
+	}
+
+	entries, fullSteps, _ := read(nil)
+	if want := [][]byte{first, last}; fmt.Sprint(entries) != fmt.Sprint(want) {
+		t.Fatalf("entries read = %x; want %x", entries, want)
+	}
+
+	// Stop short of the last entry to learn the stretch between the 2 entries.
+	stretch := keyRange{from: append(common.CopyBytes(first), 0), to: nil}
+	probe := newSkippingIterator(db, prefix, nil, 1+common.HashLength, nil, nil)
+	for probe.Next() && !bytes.Equal(probe.Key(), last) {
+		if bytes.Compare(probe.Key(), first) > 0 {
+			stretch.to = common.CopyBytes(probe.Key())
+			stretch.keys++
+		}
+	}
+	probe.Release()
+	if stretch.empty() {
+		t.Fatal("found no keys to skip between the entries")
+	}
+
+	entries, skipSteps, _ := read(keyRanges{stretch})
+	if want := [][]byte{first, last}; fmt.Sprint(entries) != fmt.Sprint(want) {
+		t.Fatalf("entries read while skipping = %x; want %x", entries, want)
+	}
+	if skipSteps >= fullSteps/10 {
+		t.Errorf("took %d steps with the stretch known and %d without; want the known stretch left unread", skipSteps, fullSteps)
+	}
+}
+
+func TestNoteProgressTrimsKnownStretches(t *testing.T) {
+	stretch := func(prefix []byte, from, to byte) keyRange {
+		return keyRange{
+			from: append(common.CopyBytes(prefix), bytes.Repeat([]byte{from}, common.HashLength)...),
+			to:   append(common.CopyBytes(prefix), bytes.Repeat([]byte{to}, common.HashLength)...),
+		}
+	}
+	ctx := &generatorContext{skips: generatorSkips{
+		account: keyRanges{stretch(rawdb.SnapshotAccountPrefix, 0x20, 0x40)},
+		storage: keyRanges{stretch(rawdb.SnapshotStoragePrefix, 0x20, 0x40)},
+	}}
+
+	current := bytes.Repeat([]byte{0x30}, 2*common.HashLength) // an account and one of its slots
+	ctx.noteProgress(current)
+
+	for name, got := range map[string]keyRanges{"account": ctx.skips.account, "storage": ctx.skips.storage} {
+		prefix := rawdb.SnapshotAccountPrefix
+		written := append(common.CopyBytes(prefix), current[:common.HashLength]...)
+		if name == "storage" {
+			prefix = rawdb.SnapshotStoragePrefix
+			written = append(common.CopyBytes(prefix), current...)
+		}
+		if len(got) != 1 || bytes.Compare(got[0].from, written) <= 0 {
+			t.Errorf("%s stretches = %x after the generator wrote up to %x; want 1 starting later", name, got, written)
+		}
+	}
+
+	ctx.noteProgress(bytes.Repeat([]byte{0x50}, common.HashLength))
+	if len(ctx.skips.account) != 0 || len(ctx.skips.storage) != 0 {
+		t.Errorf("stretches not emptied once the generator passed them: account %x, storage %x", ctx.skips.account, ctx.skips.storage)
+	}
+}
+
+func TestKeyRangesWith(t *testing.T) {
+	key := func(b byte) []byte { return []byte{b} }
+	stretch := func(from, to byte, keys int) keyRange { return keyRange{from: key(from), to: key(to), keys: keys} }
+
+	var rs keyRanges
+	rs = rs.with(stretch(0x10, 0x20, minSkipKeys-1))
+	if len(rs) != 0 {
+		t.Fatalf("kept a stretch of %d keys; want only stretches of at least %d", minSkipKeys-1, minSkipKeys)
+	}
+	rs = rs.with(stretch(0x50, 0x60, minSkipKeys))
+	rs = rs.with(stretch(0x10, 0x20, minSkipKeys))
+	rs = rs.with(stretch(0x18, 0x30, minSkipKeys*2)) // overlaps the first
+	want := keyRanges{stretch(0x10, 0x30, minSkipKeys*2), stretch(0x50, 0x60, minSkipKeys)}
+	if fmt.Sprint(rs) != fmt.Sprint(want) {
+		t.Fatalf("stretches = %v; want %v", rs, want)
+	}
+
+	rs = nil
+	for i := 0; i <= maxSkipRanges; i++ {
+		rs = rs.with(keyRange{from: []byte{byte(i >> 8), byte(i)}, to: []byte{byte(i >> 8), byte(i), 0xff}, keys: minSkipKeys + i})
+	}
+	if len(rs) != maxSkipRanges || rs[0].keys != minSkipKeys+1 {
+		t.Errorf("after adding %d stretches, kept %d starting with %d keys; want %d, without the smallest", maxSkipRanges+1, len(rs), rs[0].keys, maxSkipRanges)
+	}
+}
+
+// TestGenerateSkipsStretchesFoundEmpty restarts generation a few steps into
+// every run, as a node does on each block while generation is unfinished, over a
+// range full of keys the iterators have to step over, and checks that only
+// the first run reads them.
+func TestGenerateSkipsStretchesFoundEmpty(t *testing.T) {
+	helper := newHelper(rawdb.HashScheme)
+	stRoot := helper.makeStorageTrie(common.Hash{}, []string{"key-1", "key-2", "key-3"}, []string{"val-1", "val-2", "val-3"}, false)
+	for i := uint64(0); i < 20; i++ {
+		acc := &types.StateAccount{Balance: uint256.NewInt(i), Root: types.EmptyRootHash, CodeHash: types.EmptyCodeHash.Bytes()}
+		if i%4 == 0 {
+			acc.Root = stRoot
+			helper.makeStorageTrie(hashData([]byte(fmt.Sprintf("acc-%d", i))), []string{"key-1", "key-2", "key-3"}, []string{"val-1", "val-2", "val-3"}, true)
+		}
+		helper.addTrieAccount(fmt.Sprintf("acc-%d", i), acc)
+		if i%3 == 0 {
+			// Left over from an earlier snapshot, and wrong for this state.
+			stale := *acc
+			stale.Balance = uint256.NewInt(1_000)
+			helper.addSnapAccount(fmt.Sprintf("acc-%d", i), &stale)
+		}
+	}
+	for i := 0; i < 5; i++ {
+		// Left over from an earlier snapshot, and absent from this state.
+		helper.addSnapAccount(fmt.Sprintf("gone-%d", i), &types.StateAccount{Balance: uint256.NewInt(1), Root: types.EmptyRootHash, CodeHash: types.EmptyCodeHash.Bytes()})
+		helper.addSnapStorage(fmt.Sprintf("gone-%d", i), []string{"key-1"}, []string{"val-1"})
+	}
+	root := helper.Commit()
+
+	const skipped = 5_000
+	putTrieNodeLikeKeys(t, helper.diskdb, rawdb.SnapshotAccountPrefix, skipped)
+	putTrieNodeLikeKeys(t, helper.diskdb, rawdb.SnapshotStoragePrefix, skipped)
+
+	db := &stepCountingDB{KeyValueStore: helper.diskdb, paused: make(chan struct{}), resume: make(chan struct{})}
+	layer := generateSnapshot(db, helper.triedb, 16, root)
+
+	const maxRestarts, every = 100, 500
+	for restarts := 0; ; restarts++ {
+		db.pauseAt.Store(db.steps.Load() + every)
+		select {
+		case <-layer.genPending:
+			steps := db.steps.Load()
+			db.pauseAt.Store(0) // checkSnapRoot iterates the snapshot too
+			checkSnapRoot(t, layer, root)
+			// The first run has to read every key in both ranges once.
+			if want := int64(3 * skipped); steps > want {
+				t.Errorf("took %d iteration steps over %d restarts; want at most %d, reading the skipped keys about once", steps, restarts, want)
+			}
+			return
+		case <-db.paused:
+		case <-time.After(time.Minute):
+			t.Fatalf("generation neither paused nor finished after %d restarts", restarts)
+		}
+		if restarts == maxRestarts {
+			t.Fatalf("generation still unfinished after %d restarts", restarts)
+		}
+		next := make(chan *diskLayer)
+		go func(base *diskLayer) {
+			next <- diffToDisk(newDiffLayer(base, root, nil, nil, nil))
+		}(layer)
+		<-layer.cancel
+		db.resume <- struct{}{}
+		layer = <-next
+	}
+}
