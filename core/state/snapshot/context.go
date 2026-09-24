@@ -27,6 +27,7 @@ import (
 	"github.com/ava-labs/libevm/core/rawdb"
 	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/ethdb/memorydb"
+	"github.com/ava-labs/libevm/libevm/options"
 	"github.com/ava-labs/libevm/log"
 )
 
@@ -93,19 +94,19 @@ type generatorContext struct {
 	storage *holdableIterator   // Iterator of storage snapshot data
 	batch   ethdb.Batch         // Database batch for writing batch data atomically
 	logged  time.Time           // The timestamp when last generation progress was displayed
-	cancel  <-chan struct{}     // Closed when the generation is asked to stop
-	done    []byte              // Last position the generation finished, as passed to checkAndFlush
+
+	generatorPausing //libevm
 }
 
 // newGeneratorContext initializes the context for generation.
-func newGeneratorContext(stats *generatorStats, db ethdb.KeyValueStore, accMarker []byte, storageMarker []byte, cancel <-chan struct{}) *generatorContext {
+func newGeneratorContext(stats *generatorStats, db ethdb.KeyValueStore, accMarker []byte, storageMarker []byte, opts ...generatorContextOption) *generatorContext {
 	ctx := &generatorContext{
 		stats:  stats,
 		db:     db,
 		batch:  db.NewBatch(),
 		logged: time.Now(),
-		cancel: cancel,
 	}
+	options.ApplyTo(ctx, opts...)
 	ctx.openIterator(snapAccount, accMarker)
 	ctx.openIterator(snapStorage, storageMarker)
 	return ctx

@@ -286,7 +286,7 @@ func TestKeepProgressAfterCheckAndFlushAborts(t *testing.T) {
 	db := newCountingDB(rawdb.NewMemoryDatabase(), 0)
 	dl := &diskLayer{diskdb: db, cancel: make(chan struct{})}
 	close(dl.cancel)
-	ctx := newGeneratorContext(&generatorStats{start: time.Now()}, db, nil, nil, dl.cancel)
+	ctx := newGeneratorContext(&generatorStats{start: time.Now()}, db, nil, nil, withCancelFromDiskLayer(dl))
 	defer ctx.close()
 
 	if err := dl.checkAndFlush(ctx, common.Hash{1}.Bytes()); err != errAborted {

@@ -703,7 +703,7 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 	// For the account or storage slot at the interruption, they will be
 	// processed twice by the generator(they are already processed in the
 	// last run) but it's fine.
-	ctx := newGeneratorContext(stats, dl.diskdb, accMarker, dl.genMarker, dl.cancel)
+	ctx := newGeneratorContext(stats, dl.diskdb, accMarker, dl.genMarker, withCancelFromDiskLayer(dl))
 	defer ctx.close()
 
 	if err := generateAccounts(ctx, dl, accMarker); err != nil {

@@ -20,8 +20,26 @@ import (
 	"bytes"
 
 	"github.com/ava-labs/libevm/ethdb"
+	"github.com/ava-labs/libevm/libevm/options"
 	"github.com/ava-labs/libevm/log"
 )
+
+// generatorPausing is embedded in [generatorContext] to add libevm-specific
+// fields that allow [diskLayer.stopGeneration] to unblock more frequently.
+type generatorPausing struct {
+	cancel <-chan struct{} // Closed when the generation is asked to stop
+	done   []byte          // Last position the generation finished, as passed to checkAndFlush
+}
+
+type generatorContextOption = options.Option[generatorContext]
+
+// withCancelFromDiskLayer configures [newGeneratorContext] to use the same
+// cancellation channel as the [diskLayer].
+func withCancelFromDiskLayer(dl *diskLayer) generatorContextOption {
+	return options.Func[generatorContext](func(ctx *generatorContext) {
+		ctx.generatorPausing.cancel = dl.cancel
+	})
+}
 
 // abortableIterator stops with [errAborted] once cancel is closed. On a hash-scheme
 // database the snapshot iterators skip every trie node whose hash starts with the
