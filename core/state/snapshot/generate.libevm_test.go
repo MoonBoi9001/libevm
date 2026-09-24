@@ -31,6 +31,8 @@ import (
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/ethdb"
+	"github.com/ava-labs/libevm/ethdb/memorydb"
+	"github.com/ava-labs/libevm/rlp"
 )
 
 // countingDB counts the steps taken by its snapshot iterators and, when every
@@ -41,6 +43,9 @@ type countingDB struct {
 	paused chan struct{}
 	resume chan struct{}
 	steps  atomic.Int64
+
+	deletedPastMarker atomic.Int64 // deletions written past the marker journalled with them
+	midStorageMarkers atomic.Int64 // markers journalled part way through a contract's storage
 }
 
 func newCountingDB(db ethdb.KeyValueStore, every int64) *countingDB {
@@ -55,6 +60,62 @@ func (db *countingDB) NewIterator(prefix, start []byte) ethdb.Iterator {
 		return it
 	}
 	return &countingIterator{Iterator: it, db: db}
+}
+
+func (db *countingDB) NewBatch() ethdb.Batch {
+	return &recordingBatch{Batch: db.KeyValueStore.NewBatch(), db: db}
+}
+
+// generatorKey is the key journalProgress saves the generator's marker under.
+var generatorKey = func() []byte {
+	db := memorydb.New()
+	rawdb.WriteSnapshotGenerator(db, nil)
+	it := db.NewIterator(nil, nil)
+	defer it.Release()
+	it.Next()
+	return common.CopyBytes(it.Key())
+}()
+
+// recordingBatch reports to its countingDB what each write that journals a
+// generator marker also deleted.
+type recordingBatch struct {
+	ethdb.Batch
+	db      *countingDB
+	deleted [][]byte
+	marker  []byte
+}
+
+func (b *recordingBatch) Put(key, value []byte) error {
+	if bytes.Equal(key, generatorKey) {
+		var gen journalGenerator
+		if err := rlp.DecodeBytes(value, &gen); err != nil {
+			return err
+		}
+		b.marker = gen.Marker
+	}
+	return b.Batch.Put(key, value)
+}
+
+func (b *recordingBatch) Delete(key []byte) error {
+	b.deleted = append(b.deleted, common.CopyBytes(key))
+	return b.Batch.Delete(key)
+}
+
+func (b *recordingBatch) Write() error {
+	if len(b.marker) > common.HashLength {
+		b.db.midStorageMarkers.Add(1)
+	}
+	for _, key := range b.deleted {
+		if len(b.marker) > 0 && bytes.Compare(key[1:], b.marker) > 0 { // key[1:] drops the snapshot prefix
+			b.db.deletedPastMarker.Add(1)
+		}
+	}
+	return b.Batch.Write()
+}
+
+func (b *recordingBatch) Reset() {
+	b.deleted, b.marker = nil, nil
+	b.Batch.Reset()
 }
 
 type countingIterator struct {
@@ -165,4 +226,54 @@ func TestGenerateKeepsProgressWhenStoppedMidRange(t *testing.T) {
 	db := newCountingDB(helper.diskdb, 2_000)
 	layer := restartUntilDone(t, db, generateSnapshot(db, helper.triedb, 16, root), root, 20)
 	checkSnapRoot(t, layer, root)
+}
+
+// TestGenerateKeepsDeletionsWhenStoppedMidRange stops generation while its
+// batch still holds deletions of stale entries past the last finished position,
+// and part way through a contract's storage, then checks the finished snapshot.
+func TestGenerateKeepsDeletionsWhenStoppedMidRange(t *testing.T) {
+	helper := newHelper(rawdb.HashScheme)
+	slots := func(prefix string, n int) (keys, vals []string) {
+		for i := 0; i < n; i++ {
+			keys = append(keys, fmt.Sprintf("%s-key-%d", prefix, i))
+			vals = append(vals, fmt.Sprintf("%s-val-%d", prefix, i))
+		}
+		return keys, vals
+	}
+	addContract := func(name string, n int) *types.StateAccount {
+		keys, vals := slots(name, n)
+		root := helper.makeStorageTrie(hashData([]byte(name)), keys, vals, true)
+		acc := &types.StateAccount{Balance: uint256.NewInt(1), Root: root, CodeHash: types.EmptyCodeHash.Bytes()}
+		helper.addAccount(name, acc)
+		helper.addSnapStorage(name, keys, vals)
+		staleKeys, staleVals := slots(name+"-stale", 3)
+		helper.addSnapStorage(name, staleKeys, staleVals)
+		return acc
+	}
+	for i := 0; i < 200; i++ {
+		acc := addContract(fmt.Sprintf("acc-%d", i), 10)
+
+		gone := fmt.Sprintf("gone-%d", i) // in the snapshot only
+		keys, vals := slots(gone, 3)
+		helper.addSnapAccount(gone, acc)
+		helper.addSnapStorage(gone, keys, vals)
+
+		orphan := fmt.Sprintf("orphan-%d", i) // storage without an account
+		keys, vals = slots(orphan, 3)
+		helper.addSnapStorage(orphan, keys, vals)
+	}
+	addContract("big", 3*storageCheckRange)
+	root := helper.Commit()
+
+	db := newCountingDB(helper.diskdb, 1_500)
+	layer := restartUntilDone(t, db, generateSnapshot(db, helper.triedb, 16, root), root, 50)
+	checkSnapRoot(t, layer, root)
+
+	if db.deletedPastMarker.Load() == 0 {
+		t.Error("no stop saved deletions past its marker; the test no longer covers that case")
+	}
+	if db.midStorageMarkers.Load() == 0 {
+		t.Error("no stop landed inside a contract's storage; the test no longer covers that case")
+	}
+	t.Logf("%d deletions saved past a marker, %d markers inside a contract's storage", db.deletedPastMarker.Load(), db.midStorageMarkers.Load())
 }
