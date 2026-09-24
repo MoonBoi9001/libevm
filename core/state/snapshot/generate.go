@@ -484,7 +484,7 @@ func (dl *diskLayer) generateRange(ctx *generatorContext, trieId *trie.ID, prefi
 // checkAndFlush checks if an interruption signal is received or the
 // batch size has exceeded the allowance.
 func (dl *diskLayer) checkAndFlush(ctx *generatorContext, current []byte) error {
-	ctx.done = common.CopyBytes(current)
+	ctx.progress = common.CopyBytes(current)
 
 	aborting := false
 	select {

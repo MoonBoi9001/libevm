@@ -27,8 +27,8 @@ import (
 // generatorPausing is embedded in [generatorContext] to add libevm-specific
 // fields that allow [diskLayer.stopGeneration] to unblock more frequently.
 type generatorPausing struct {
-	cancel <-chan struct{} // Closed when the generation is asked to stop
-	done   []byte          // Last position the generation finished, as passed to checkAndFlush
+	cancel   <-chan struct{} // Closed when the generation is asked to stop
+	progress []byte          // Last position the generation finished, as passed to checkAndFlush
 }
 
 type generatorContextOption = options.Option[generatorContext]
@@ -78,13 +78,13 @@ func (it *abortableIterator) Error() error {
 // when it is the one to see the stop request. Past ctx.done the batch holds only
 // deletions of entries missing from the trie, which are safe to keep.
 func (dl *diskLayer) keepProgress(ctx *generatorContext) {
-	if ctx.done == nil {
+	if ctx.progress == nil {
 		return
 	}
-	if ctx.batch.ValueSize() == 0 && bytes.Equal(ctx.done, dl.genMarker) {
+	if ctx.batch.ValueSize() == 0 && bytes.Equal(ctx.progress, dl.genMarker) {
 		return // checkAndFlush saw the stop and has saved everything already
 	}
-	journalProgress(ctx.batch, ctx.done, ctx.stats)
+	journalProgress(ctx.batch, ctx.progress, ctx.stats)
 	if err := ctx.batch.Write(); err != nil {
 		log.Error("Failed to flush batch", "err", err)
 		return
@@ -92,6 +92,6 @@ func (dl *diskLayer) keepProgress(ctx *generatorContext) {
 	ctx.batch.Reset()
 
 	dl.lock.Lock()
-	dl.genMarker = ctx.done
+	dl.genMarker = ctx.progress
 	dl.lock.Unlock()
 }
