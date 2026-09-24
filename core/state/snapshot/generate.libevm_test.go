@@ -46,6 +46,7 @@ type countingDB struct {
 
 	deletedPastMarker atomic.Int64 // deletions written past the marker journalled with them
 	midStorageMarkers atomic.Int64 // markers journalled part way through a contract's storage
+	writes            atomic.Int64
 }
 
 func newCountingDB(db ethdb.KeyValueStore, every int64) *countingDB {
@@ -102,6 +103,7 @@ func (b *recordingBatch) Delete(key []byte) error {
 }
 
 func (b *recordingBatch) Write() error {
+	b.db.writes.Add(1)
 	if len(b.marker) > common.HashLength {
 		b.db.midStorageMarkers.Add(1)
 	}
@@ -276,4 +278,23 @@ func TestGenerateKeepsDeletionsWhenStoppedMidRange(t *testing.T) {
 		t.Error("no stop landed inside a contract's storage; the test no longer covers that case")
 	}
 	t.Logf("%d deletions saved past a marker, %d markers inside a contract's storage", db.deletedPastMarker.Load(), db.midStorageMarkers.Load())
+}
+
+// TestKeepProgressAfterCheckAndFlushAborts covers a stop seen between ranges,
+// where checkAndFlush has already saved the run's work.
+func TestKeepProgressAfterCheckAndFlushAborts(t *testing.T) {
+	db := newCountingDB(rawdb.NewMemoryDatabase(), 0)
+	dl := &diskLayer{diskdb: db, cancel: make(chan struct{})}
+	close(dl.cancel)
+	ctx := newGeneratorContext(&generatorStats{start: time.Now()}, db, nil, nil, dl.cancel)
+	defer ctx.close()
+
+	if err := dl.checkAndFlush(ctx, common.Hash{1}.Bytes()); err != errAborted {
+		t.Fatalf("checkAndFlush() = %v; want %v", err, errAborted)
+	}
+	writes := db.writes.Load()
+	dl.keepProgress(ctx)
+	if got := db.writes.Load(); got != writes {
+		t.Errorf("keepProgress made %d more writes; want 0, as checkAndFlush saved the work", got-writes)
+	}
 }

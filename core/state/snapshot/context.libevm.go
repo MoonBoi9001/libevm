@@ -17,6 +17,8 @@
 package snapshot
 
 import (
+	"bytes"
+
 	"github.com/ava-labs/libevm/ethdb"
 	"github.com/ava-labs/libevm/log"
 )
@@ -60,6 +62,9 @@ func (it *abortableIterator) Error() error {
 func (dl *diskLayer) keepProgress(ctx *generatorContext) {
 	if ctx.done == nil {
 		return
+	}
+	if ctx.batch.ValueSize() == 0 && bytes.Equal(ctx.done, dl.genMarker) {
+		return // checkAndFlush saw the stop and has saved everything already
 	}
 	journalProgress(ctx.batch, ctx.done, ctx.stats)
 	if err := ctx.batch.Write(); err != nil {
