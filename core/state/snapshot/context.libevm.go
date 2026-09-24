@@ -16,7 +16,10 @@
 
 package snapshot
 
-import "github.com/ava-labs/libevm/ethdb"
+import (
+	"github.com/ava-labs/libevm/ethdb"
+	"github.com/ava-labs/libevm/log"
+)
 
 // abortableIterator stops with [errAborted] once cancel is closed. On a hash-scheme
 // database the snapshot iterators skip every trie node whose hash starts with the
@@ -49,4 +52,23 @@ func (it *abortableIterator) Error() error {
 		return it.err
 	}
 	return it.Iterator.Error()
+}
+
+// keepProgress saves the work an aborted run finished, as checkAndFlush does
+// when it is the one to see the stop request. Past ctx.done the batch holds only
+// deletions of entries missing from the trie, which are safe to keep.
+func (dl *diskLayer) keepProgress(ctx *generatorContext) {
+	if ctx.done == nil {
+		return
+	}
+	journalProgress(ctx.batch, ctx.done, ctx.stats)
+	if err := ctx.batch.Write(); err != nil {
+		log.Error("Failed to flush batch", "err", err)
+		return
+	}
+	ctx.batch.Reset()
+
+	dl.lock.Lock()
+	dl.genMarker = ctx.done
+	dl.lock.Unlock()
 }

@@ -484,6 +484,8 @@ func (dl *diskLayer) generateRange(ctx *generatorContext, trieId *trie.ID, prefi
 // checkAndFlush checks if an interruption signal is received or the
 // batch size has exceeded the allowance.
 func (dl *diskLayer) checkAndFlush(ctx *generatorContext, current []byte) error {
+	ctx.done = common.CopyBytes(current)
+
 	aborting := false
 	select {
 	case <-dl.cancel:
@@ -707,6 +709,7 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 	if err := generateAccounts(ctx, dl, accMarker); err != nil {
 		// Check if error was due to abort
 		if err == errAborted {
+			dl.keepProgress(ctx)
 			stats.Log("Aborting state snapshot generation", dl.root, dl.genMarker)
 		}
 		dl.genStats = stats

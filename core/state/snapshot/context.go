@@ -94,6 +94,7 @@ type generatorContext struct {
 	batch   ethdb.Batch         // Database batch for writing batch data atomically
 	logged  time.Time           // The timestamp when last generation progress was displayed
 	cancel  <-chan struct{}     // Closed when the generation is asked to stop
+	done    []byte              // Last position the generation finished, as passed to checkAndFlush
 }
 
 // newGeneratorContext initializes the context for generation.

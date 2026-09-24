@@ -19,83 +19,100 @@ package snapshot
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/holiman/uint256"
 
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/rawdb"
 	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/crypto"
 	"github.com/ava-labs/libevm/ethdb"
 )
 
-// pausingDB hands out account snapshot iterators that pause on a chosen step,
-// so a test can ask the generator to stop partway through an iteration.
-type pausingDB struct {
+// countingDB counts the steps taken by its snapshot iterators and, when every
+// is set, pauses on each multiple of it so a test can stop generation there.
+type countingDB struct {
 	ethdb.KeyValueStore
-	pauseAt int64
-	paused  chan struct{}
-	resume  chan struct{}
-	steps   atomic.Int64
+	every  atomic.Int64
+	paused chan struct{}
+	resume chan struct{}
+	steps  atomic.Int64
 }
 
-func (db *pausingDB) NewIterator(prefix, start []byte) ethdb.Iterator {
+func newCountingDB(db ethdb.KeyValueStore, every int64) *countingDB {
+	c := &countingDB{KeyValueStore: db, paused: make(chan struct{}), resume: make(chan struct{})}
+	c.every.Store(every)
+	return c
+}
+
+func (db *countingDB) NewIterator(prefix, start []byte) ethdb.Iterator {
 	it := db.KeyValueStore.NewIterator(prefix, start)
-	if !bytes.Equal(prefix, rawdb.SnapshotAccountPrefix) {
+	if !bytes.Equal(prefix, rawdb.SnapshotAccountPrefix) && !bytes.Equal(prefix, rawdb.SnapshotStoragePrefix) {
 		return it
 	}
-	return &pausingIterator{Iterator: it, db: db}
+	return &countingIterator{Iterator: it, db: db}
 }
 
-type pausingIterator struct {
+type countingIterator struct {
 	ethdb.Iterator
-	db *pausingDB
+	db *countingDB
 }
 
-func (it *pausingIterator) Next() bool {
-	if it.db.steps.Add(1) == it.db.pauseAt {
-		close(it.db.paused)
+func (it *countingIterator) Next() bool {
+	if n, every := it.db.steps.Add(1), it.db.every.Load(); every > 0 && n%every == 0 {
+		it.db.paused <- struct{}{}
 		<-it.db.resume
 	}
 	return it.Iterator.Next()
+}
+
+// waitForPause fails the test instead of hanging if the pause never comes.
+func (db *countingDB) waitForPause(t *testing.T) {
+	t.Helper()
+	select {
+	case <-db.paused:
+	case <-time.After(time.Minute):
+		t.Fatalf("iterators never reached step %d", db.every.Load())
+	}
+}
+
+// putSkippedKeys stores n keys of a hash-scheme trie node's length that start
+// with prefix, spread over the range the way node hashes are. The snapshot
+// iterators cover that range, so they have to step over every one of them.
+func putSkippedKeys(t *testing.T, db ethdb.KeyValueWriter, prefix []byte, n uint64) {
+	t.Helper()
+	for i := uint64(0); i < n; i++ {
+		var seed [8]byte
+		binary.BigEndian.PutUint64(seed[:], i)
+		key := append(common.CopyBytes(prefix), crypto.Keccak256(prefix, seed[:])[:common.HashLength-len(prefix)]...)
+		if err := db.Put(key, []byte{1}); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestGenerateStopsWhileSkippingKeys(t *testing.T) {
 	helper := newHelper(rawdb.HashScheme)
 	helper.addTrieAccount("acc-1", &types.StateAccount{Balance: uint256.NewInt(1), Root: types.EmptyRootHash, CodeHash: types.EmptyCodeHash.Bytes()})
 	root := helper.Commit()
-
-	// A hash-scheme database stores trie nodes under their bare 32-byte hash,
-	// so the nodes whose hash starts with the account snapshot prefix fall
-	// inside the range the generator iterates, and it has to step over them.
-	const skipped = 10_000
-	for i := uint64(0); i < skipped; i++ {
-		key := make([]byte, common.HashLength)
-		key[0] = rawdb.SnapshotAccountPrefix[0]
-		binary.BigEndian.PutUint64(key[1:], i)
-		if err := helper.diskdb.Put(key, []byte{1}); err != nil {
-			t.Fatal(err)
-		}
-	}
+	putSkippedKeys(t, helper.diskdb, rawdb.SnapshotAccountPrefix, 10_000)
 
 	const pauseAt = 100
-	db := &pausingDB{
-		KeyValueStore: helper.diskdb,
-		pauseAt:       pauseAt,
-		paused:        make(chan struct{}),
-		resume:        make(chan struct{}),
-	}
+	db := newCountingDB(helper.diskdb, pauseAt)
 	snap := generateSnapshot(db, helper.triedb, 16, root)
 
-	<-db.paused
+	db.waitForPause(t)
 	stopped := make(chan struct{})
 	go func() {
 		snap.stopGeneration()
 		close(stopped)
 	}()
 	<-snap.cancel // closed by stopGeneration before it waits for the generator
-	close(db.resume)
+	db.resume <- struct{}{}
 	<-stopped
 
 	if got := db.steps.Load(); got > pauseAt {
@@ -104,4 +121,48 @@ func TestGenerateStopsWhileSkippingKeys(t *testing.T) {
 	if len(snap.genMarker) != 0 {
 		t.Errorf("generator marker = %#x after stopping mid-iteration; want no progress recorded", snap.genMarker)
 	}
+}
+
+// restartUntilDone restarts generation on a fresh disk layer, as a node does on
+// each block, every time db pauses, until the snapshot is complete.
+func restartUntilDone(t *testing.T, db *countingDB, layer *diskLayer, root common.Hash, maxRestarts int) *diskLayer {
+	t.Helper()
+	for restarts := 0; ; restarts++ {
+		select {
+		case <-layer.genPending:
+			db.every.Store(0) // the checks that follow iterate the snapshot too
+			t.Logf("finished after %d restarts and %d iteration steps", restarts, db.steps.Load())
+			return layer
+		case <-db.paused:
+		case <-time.After(time.Minute):
+			t.Fatalf("generation neither paused nor finished after %d restarts", restarts)
+		}
+		if restarts == maxRestarts {
+			close(db.resume)
+			t.Fatalf("generation still unfinished after %d restarts and %d iteration steps", restarts, db.steps.Load())
+		}
+		next := make(chan *diskLayer)
+		go func(base *diskLayer) {
+			next <- diffToDisk(newDiffLayer(base, root, nil, nil, nil))
+		}(layer)
+		<-layer.cancel
+		db.resume <- struct{}{}
+		layer = <-next
+	}
+}
+
+// TestGenerateKeepsProgressWhenStoppedMidRange stops generation while it reads
+// a range of existing snapshot entries, after it has finished earlier ranges.
+func TestGenerateKeepsProgressWhenStoppedMidRange(t *testing.T) {
+	helper := newHelper(rawdb.HashScheme)
+	for i := uint64(0); i < 300; i++ {
+		acc := &types.StateAccount{Balance: uint256.NewInt(i), Root: types.EmptyRootHash, CodeHash: types.EmptyCodeHash.Bytes()}
+		helper.addAccount(fmt.Sprintf("acc-%d", i), acc)
+	}
+	root := helper.Commit()
+	putSkippedKeys(t, helper.diskdb, rawdb.SnapshotAccountPrefix, 3_000)
+
+	db := newCountingDB(helper.diskdb, 2_000)
+	layer := restartUntilDone(t, db, generateSnapshot(db, helper.triedb, 16, root), root, 20)
+	checkSnapRoot(t, layer, root)
 }
