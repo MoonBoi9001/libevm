@@ -75,8 +75,8 @@ func (it *abortableIterator) Error() error {
 }
 
 // keepProgress saves the work an aborted run finished, as checkAndFlush does
-// when it is the one to see the stop request. Past ctx.done the batch holds only
-// deletions of entries missing from the trie, which are safe to keep.
+// when it is the one to see the stop request. Past ctx.progress the batch holds
+// only deletions of entries missing from the trie, which are safe to keep.
 func (dl *diskLayer) keepProgress(ctx *generatorContext) {
 	if ctx.progress == nil {
 		return
