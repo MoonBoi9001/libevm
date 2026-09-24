@@ -44,9 +44,10 @@ type countingDB struct {
 	resume chan struct{}
 	steps  atomic.Int64
 
-	deletedPastMarker atomic.Int64 // deletions written past the marker journalled with them
+	deletedPastMarker atomic.Int64 // deletions written past the next marker journalled
 	midStorageMarkers atomic.Int64 // markers journalled part way through a contract's storage
 	writes            atomic.Int64
+	unjournalled      [][]byte // deletions written since the last marker was journalled
 }
 
 func newCountingDB(db ethdb.KeyValueStore, every int64) *countingDB {
@@ -77,13 +78,14 @@ var generatorKey = func() []byte {
 	return common.CopyBytes(it.Key())
 }()
 
-// recordingBatch reports to its countingDB what each write that journals a
-// generator marker also deleted.
+// recordingBatch reports to its countingDB what each write deleted and which
+// generator marker, if any, it journalled.
 type recordingBatch struct {
 	ethdb.Batch
-	db      *countingDB
-	deleted [][]byte
-	marker  []byte
+	db       *countingDB
+	deleted  [][]byte
+	journals bool
+	marker   []byte
 }
 
 func (b *recordingBatch) Put(key, value []byte) error {
@@ -92,7 +94,7 @@ func (b *recordingBatch) Put(key, value []byte) error {
 		if err := rlp.DecodeBytes(value, &gen); err != nil {
 			return err
 		}
-		b.marker = gen.Marker
+		b.journals, b.marker = true, gen.Marker
 	}
 	return b.Batch.Put(key, value)
 }
@@ -104,20 +106,32 @@ func (b *recordingBatch) Delete(key []byte) error {
 
 func (b *recordingBatch) Write() error {
 	b.db.writes.Add(1)
-	if len(b.marker) > common.HashLength {
-		b.db.midStorageMarkers.Add(1)
-	}
-	for _, key := range b.deleted {
-		if len(b.marker) > 0 && bytes.Compare(key[1:], b.marker) > 0 { // key[1:] drops the snapshot prefix
-			b.db.deletedPastMarker.Add(1)
-		}
-	}
+	b.db.recordWrite(b.deleted, b.journals, b.marker)
 	return b.Batch.Write()
 }
 
 func (b *recordingBatch) Reset() {
-	b.deleted, b.marker = nil, nil
+	b.deleted, b.journals, b.marker = nil, false, nil
 	b.Batch.Reset()
+}
+
+// recordWrite compares deletions with the next marker journalled rather than
+// one in the same write, as a stop seen by an iterator leaves the marker to the
+// write that follows it.
+func (db *countingDB) recordWrite(deleted [][]byte, journals bool, marker []byte) {
+	db.unjournalled = append(db.unjournalled, deleted...)
+	if !journals {
+		return
+	}
+	if len(marker) > common.HashLength {
+		db.midStorageMarkers.Add(1)
+	}
+	for _, key := range db.unjournalled {
+		if len(marker) > 0 && bytes.Compare(key[1:], marker) > 0 { // key[1:] drops the snapshot prefix
+			db.deletedPastMarker.Add(1)
+		}
+	}
+	db.unjournalled = nil
 }
 
 type countingIterator struct {

@@ -84,7 +84,6 @@ func (dl *diskLayer) keepProgress(ctx *generatorContext) {
 	if ctx.batch.ValueSize() == 0 && bytes.Equal(ctx.progress, dl.genMarker) {
 		return // checkAndFlush saw the stop and has saved everything already
 	}
-	journalProgress(ctx.batch, ctx.progress, ctx.stats)
 	if err := ctx.batch.Write(); err != nil {
 		log.Error("Failed to flush batch", "err", err)
 		return
