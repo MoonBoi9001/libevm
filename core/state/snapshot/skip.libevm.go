@@ -165,11 +165,12 @@ func (it *skippingIterator) Next() bool {
 	return false
 }
 
-// keepRun records the stretch read since the last key of keyLen.
+// keepRun records the stretch read since the last key of keyLen, once.
 func (it *skippingIterator) keepRun() {
 	if it.found != nil {
 		*it.found = it.found.with(it.run)
 	}
+	it.run = keyRange{}
 }
 
 func (it *skippingIterator) Error() error  { return it.it.Error() }

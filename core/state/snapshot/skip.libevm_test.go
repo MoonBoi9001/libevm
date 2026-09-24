@@ -225,6 +225,24 @@ func TestKeyRangesAfter(t *testing.T) {
 	}
 }
 
+// TestKeepReadRecordsStretchOnce reads an iterator's stretch twice, as a run
+// does when an iterator runs out and then the run ends.
+func TestKeepReadRecordsStretchOnce(t *testing.T) {
+	ctx := &generatorContext{}
+	ctx.accountRead = &skippingIterator{
+		found: &ctx.skips.account,
+		run:   keyRange{from: []byte{0x10}, to: []byte{0x20}, keys: minSkipKeys},
+	}
+	ctx.keepRead(snapAccount)
+	ctx.skips.account = ctx.skips.account.after([]byte{0x18})
+	ctx.keepRead(snapAccount)
+
+	want := keyRanges{{from: []byte{0x18, 0}, to: []byte{0x20}, keys: minSkipKeys}}
+	if fmt.Sprint(ctx.skips.account) != fmt.Sprint(want) {
+		t.Errorf("stretches = %v; want %v, the trimmed stretch not recorded again", ctx.skips.account, want)
+	}
+}
+
 // TestGenerateSkipsStretchesFoundEmpty restarts generation a few steps into
 // every run, as a node does on each block while generation is unfinished, over a
 // range full of keys the iterators have to step over, and checks that only
