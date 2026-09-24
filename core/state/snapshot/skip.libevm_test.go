@@ -43,8 +43,22 @@ type stepCountingDB struct {
 	ethdb.KeyValueStore
 	steps   atomic.Int64
 	pauseAt atomic.Int64
+	every   atomic.Int64
+	batches atomic.Int64
 	paused  chan struct{}
 	resume  chan struct{}
+}
+
+// NewBatch sets pauseAt every steps ahead, if every is set. A generator run
+// opens its batch before its iterators, so each run pauses that far in. Only
+// iterators opened since can pause, as diffToDisk opens its batch before the
+// run it replaces has stopped.
+func (db *stepCountingDB) NewBatch() ethdb.Batch {
+	db.batches.Add(1)
+	if every := db.every.Load(); every > 0 {
+		db.pauseAt.Store(db.steps.Load() + every)
+	}
+	return db.KeyValueStore.NewBatch()
 }
 
 func (db *stepCountingDB) NewIterator(prefix, start []byte) ethdb.Iterator {
@@ -52,16 +66,17 @@ func (db *stepCountingDB) NewIterator(prefix, start []byte) ethdb.Iterator {
 	if !bytes.Equal(prefix, rawdb.SnapshotAccountPrefix) && !bytes.Equal(prefix, rawdb.SnapshotStoragePrefix) {
 		return it
 	}
-	return &stepCountingIterator{Iterator: it, db: db}
+	return &stepCountingIterator{Iterator: it, db: db, batch: db.batches.Load()}
 }
 
 type stepCountingIterator struct {
 	ethdb.Iterator
-	db *stepCountingDB
+	db    *stepCountingDB
+	batch int64 // Batches opened before this iterator
 }
 
 func (it *stepCountingIterator) Next() bool {
-	if it.db.steps.Add(1) == it.db.pauseAt.Load() {
+	if it.db.steps.Add(1) == it.db.pauseAt.Load() && it.batch == it.db.batches.Load() {
 		it.db.paused <- struct{}{}
 		<-it.db.resume
 	}
@@ -275,16 +290,18 @@ func TestGenerateSkipsStretchesFoundEmpty(t *testing.T) {
 	putTrieNodeLikeKeys(t, helper.diskdb, rawdb.SnapshotAccountPrefix, skipped)
 	putTrieNodeLikeKeys(t, helper.diskdb, rawdb.SnapshotStoragePrefix, skipped)
 
+	const maxRestarts, every = 100, 500
 	db := &stepCountingDB{KeyValueStore: helper.diskdb, paused: make(chan struct{}), resume: make(chan struct{})}
+	db.every.Store(every)
 	layer := generateSnapshot(db, helper.triedb, 16, root)
 
-	const maxRestarts, every = 100, 500
 	for restarts := 0; ; restarts++ {
-		db.pauseAt.Store(db.steps.Load() + every)
 		select {
 		case <-layer.genPending:
 			steps := db.steps.Load()
+			db.every.Store(0)
 			db.pauseAt.Store(0) // checkSnapRoot iterates the snapshot too
+			t.Logf("finished after %d restarts and %d iteration steps", restarts, steps)
 			checkSnapRoot(t, layer, root)
 			// The first run has to read every key in both ranges once.
 			if want := int64(3 * skipped); steps > want {
