@@ -184,11 +184,8 @@ func (db *steppingIterDB) NewIterator(prefix []byte, start []byte) ethdb.Iterato
 func TestGenerateStopsWhileSkippingKeys(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) { //nolint:thelper // False positive, fixed in thelper v0.7.1.
 		helper := newHelper(rawdb.HashScheme)
-		helper.addAccount("acc", &types.StateAccount{
-			Balance:  uint256.NewInt(1),
-			Root:     types.EmptyRootHash,
-			CodeHash: types.EmptyCodeHash.Bytes(),
-		})
+		// The helper doesn't require any contents because we're only concerned
+		// with our ability to abort the skipping of hashdb-originated keys.
 		root := helper.Commit()
 		putSkippedKeys(t, helper.diskdb, rawdb.SnapshotAccountPrefix, 10_000)
 
