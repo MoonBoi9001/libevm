@@ -152,9 +152,7 @@ func putSkippedKeys(t *testing.T, db ethdb.KeyValueWriter, prefix []byte, n uint
 
 	rng := rand.New(rand.NewSource(0)) //nolint:gosec // Seeded so every run stores the same keys
 	for range n {
-		if _, err := rng.Read(rest); err != nil {
-			t.Fatalf("%T.Read(): %v", rng, err)
-		}
+		rng.Read(rest) //nolint:gosec // Documented to always return a nil error
 		if err := db.Put(key.Bytes(), []byte{1}); err != nil {
 			t.Fatalf("%T.Put(%v, ...): %v", db, key, err)
 		}
