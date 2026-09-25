@@ -139,16 +139,6 @@ func (it *countingIterator) Next() bool {
 	return it.Iterator.Next()
 }
 
-// waitForPause fails the test instead of hanging if the pause never comes.
-func (db *countingDB) waitForPause(t *testing.T) {
-	t.Helper()
-	select {
-	case <-db.paused:
-	case <-time.After(time.Minute):
-		t.Fatalf("iterators never reached step %d", db.every.Load())
-	}
-}
-
 // putSkippedKeys stores n uniformly distributed keys of size
 // [common.HashLength], each with the specified prefix. The snapshot iterators
 // cover that range with a [rawdb.KeyLengthIterator] of different length, so
@@ -160,9 +150,11 @@ func putSkippedKeys(t *testing.T, db ethdb.KeyValueWriter, prefix []byte, n uint
 	copy(key[:], prefix)
 	rest := key[min(len(prefix), len(key)):]
 
-	rng := rand.New(rand.NewSource(0))
+	rng := rand.New(rand.NewSource(0)) //nolint:gosec // Seeded so every run stores the same keys
 	for range n {
-		rng.Read(rest)
+		if _, err := rng.Read(rest); err != nil {
+			t.Fatalf("%T.Read(): %v", rng, err)
+		}
 		if err := db.Put(key.Bytes(), []byte{1}); err != nil {
 			t.Fatalf("%T.Put(%v, ...): %v", db, key, err)
 		}
@@ -192,7 +184,7 @@ func (db *steppingIterDB) NewIterator(prefix []byte, start []byte) ethdb.Iterato
 }
 
 func TestGenerateStopsWhileSkippingKeys(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) { //nolint:thelper // False positive, fixed in thelper v0.7.1.
 		helper := newHelper(rawdb.HashScheme)
 		helper.addAccount("acc", &types.StateAccount{
 			Balance:  uint256.NewInt(1),
