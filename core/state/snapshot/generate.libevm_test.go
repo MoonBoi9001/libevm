@@ -221,6 +221,9 @@ func restartUntilDone(t *testing.T, db *countingDB, layer *diskLayer, root commo
 	for restarts := 0; ; restarts++ {
 		select {
 		case <-layer.genPending:
+			if restarts == 0 {
+				t.Fatal("BAD TEST SETUP: finished with zero restarts")
+			}
 			db.every.Store(0) // the checks that follow iterate the snapshot too
 			t.Logf("finished after %d restarts and %d iteration steps", restarts, db.steps.Load())
 			return layer
