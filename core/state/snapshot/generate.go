@@ -711,6 +711,8 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 		if err == errAborted {
 			dl.keepProgress(ctx)
 			stats.Log("Aborting state snapshot generation", dl.root, dl.genMarker)
+		} else {
+			log.Error("State snapshot generation failed", "root", dl.root, "err", err)
 		}
 		dl.genStats = stats
 		return
