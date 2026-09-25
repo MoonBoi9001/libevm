@@ -177,32 +177,62 @@ func putSkippedKeys(t *testing.T, db ethdb.KeyValueWriter, prefix []byte, n uint
 	}
 }
 
+type steppingIterator struct {
+	ethdb.Iterator
+	step <-chan struct{}
+}
+
+func (it *steppingIterator) Next() bool {
+	<-it.step
+	return it.Iterator.Next()
+}
+
+type steppingIterDB struct {
+	ethdb.Database
+	step <-chan struct{}
+}
+
+func (db *steppingIterDB) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
+	return &steppingIterator{
+		db.Database.NewIterator(prefix, start),
+		db.step,
+	}
+}
+
 func TestGenerateStopsWhileSkippingKeys(t *testing.T) {
-	helper := newHelper(rawdb.HashScheme)
-	helper.addTrieAccount("acc-1", &types.StateAccount{Balance: uint256.NewInt(1), Root: types.EmptyRootHash, CodeHash: types.EmptyCodeHash.Bytes()})
-	root := helper.Commit()
-	putSkippedKeys(t, helper.diskdb, rawdb.SnapshotAccountPrefix, 10_000)
+	synctest.Test(t, func(t *testing.T) {
+		helper := newHelper(rawdb.HashScheme)
+		helper.addAccount("acc", &types.StateAccount{
+			Balance:  uint256.NewInt(1),
+			Root:     types.EmptyRootHash,
+			CodeHash: types.EmptyCodeHash.Bytes(),
+		})
+		root := helper.Commit()
+		putSkippedKeys(t, helper.diskdb, rawdb.SnapshotAccountPrefix, 10_000)
 
-	const pauseAt = 100
-	db := newCountingDB(helper.diskdb, pauseAt)
-	snap := generateSnapshot(db, helper.triedb, 16, root)
+		step := make(chan struct{})
+		db := &steppingIterDB{helper.diskdb, step}
+		snap := generateSnapshot(db, helper.triedb, 16, root)
 
-	db.waitForPause(t)
-	stopped := make(chan struct{})
-	go func() {
-		snap.stopGeneration()
-		close(stopped)
-	}()
-	<-snap.cancel // closed by stopGeneration before it waits for the generator
-	db.resume <- struct{}{}
-	<-stopped
+		synctest.Wait() // generator blocked in [rawdb.KeyLengthIterator.Next]
+		for range 5 {
+			step <- struct{}{} // skipping is actually happening
+		}
+		synctest.Wait() // generator blocked as before
 
-	if got := db.steps.Load(); got > pauseAt {
-		t.Errorf("generator took %d iteration steps; want it to stop at step %d, where it was asked to", got, pauseAt)
-	}
-	if len(snap.genMarker) != 0 {
-		t.Errorf("generator marker = %#x after stopping mid-iteration; want no progress recorded", snap.genMarker)
-	}
+		stopped := make(chan struct{})
+		go func() {
+			snap.stopGeneration()
+			close(stopped)
+		}()
+		synctest.Wait()    // [diskLayer.stopGeneration] blocked on <-done,
+		step <- struct{}{} // allow next [abortableIterator.Next] to register cancellation
+		<-stopped
+
+		if len(snap.genMarker) != 0 {
+			t.Errorf("%T.genMarker = %#x after stopping mid-iteration; want no progress recorded", snap, snap.genMarker)
+		}
+	})
 }
 
 // restartUntilDone restarts generation on a fresh disk layer, as a node does on
