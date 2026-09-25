@@ -157,17 +157,22 @@ func (db *countingDB) waitForPause(t *testing.T) {
 	}
 }
 
-// putSkippedKeys stores n keys of a hash-scheme trie node's length that start
-// with prefix, spread over the range the way node hashes are. The snapshot
-// iterators cover that range, so they have to step over every one of them.
+// putSkippedKeys stores n uniformly distributed keys of size
+// [common.HashLength], each with the specified prefix. The snapshot iterators
+// cover that range with a [rawdb.KeyLengthIterator] of different length, so
+// they have to step over every one of them.
 func putSkippedKeys(t *testing.T, db ethdb.KeyValueWriter, prefix []byte, n uint64) {
 	t.Helper()
-	for i := uint64(0); i < n; i++ {
-		var seed [8]byte
-		binary.BigEndian.PutUint64(seed[:], i)
-		key := append(common.CopyBytes(prefix), crypto.Keccak256(prefix, seed[:])[:common.HashLength-len(prefix)]...)
-		if err := db.Put(key, []byte{1}); err != nil {
-			t.Fatal(err)
+
+	var key common.Hash
+	copy(key[:], prefix)
+	rest := key[min(len(prefix), len(key)):]
+
+	rng := rand.New(rand.NewSource(0))
+	for range n {
+		rng.Read(rest)
+		if err := db.Put(key.Bytes(), []byte{1}); err != nil {
+			t.Fatalf("%T.Put(%v, ...): %v", db, key, err)
 		}
 	}
 }
