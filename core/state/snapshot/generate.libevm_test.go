@@ -31,7 +31,6 @@ import (
 	"github.com/ava-labs/libevm/core/rawdb"
 	"github.com/ava-labs/libevm/core/types"
 	"github.com/ava-labs/libevm/ethdb"
-	"github.com/ava-labs/libevm/ethdb/memorydb"
 	"github.com/ava-labs/libevm/rlp"
 )
 
@@ -69,14 +68,7 @@ func (db *countingDB) NewBatch() ethdb.Batch {
 }
 
 // generatorKey is the key journalProgress saves the generator's marker under.
-var generatorKey = func() []byte {
-	db := memorydb.New()
-	rawdb.WriteSnapshotGenerator(db, nil)
-	it := db.NewIterator(nil, nil)
-	defer it.Release()
-	it.Next()
-	return common.CopyBytes(it.Key())
-}()
+var generatorKey = []byte("SnapshotGenerator")
 
 // recordingBatch reports to its countingDB what each write deleted and which
 // generator marker, if any, it journalled.
